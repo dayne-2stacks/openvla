@@ -587,6 +587,8 @@ python experiments/robot/libero/run_libero_eval.py \
 * `--shift_name`: shift family (`none` by default, or `appearance`)
 * `--shift_mode`: mode for the shift (`noise_blur_gamma` by default)
 * `--severity`: integer severity in `[1, 5]` (used when `--shift_name appearance`)
+* `--sweep_severity`: optional sweep label in `[0, 4]` used for aggregation/plotting
+* `--metrics_output_path`: optional explicit path for structured metrics JSON output
 
 The default configuration (`--shift_name none`) preserves the original behavior exactly.
 
@@ -601,6 +603,27 @@ python experiments/robot/libero/run_libero_eval.py \
   --shift_mode noise_blur_gamma \
   --severity 3 \
   --seed 7
+```
+
+Each run now writes a structured metrics file:
+* default path: `<local_log_dir>/<run_id>.metrics.json`
+* console marker: `Saved metrics JSON at path ...`
+
+You can automate severity/seed sweeps and plotting with:
+
+```bash
+# Launch severity x seed sweep (defaults: severity 0..4, seeds 0/1/2, 5 trials per task)
+python experiments/robot/libero/run_shift_sweep.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial \
+  --center_crop True \
+  --num_trials_per_task 5
+
+# Aggregate metrics and generate curves/tables
+python experiments/robot/libero/analyze_shift_sweeps.py \
+  --metrics_glob "./experiments/logs/*.metrics.json" \
+  --task_suite_name libero_spatial
 ```
 
 Notes:

@@ -17,6 +17,7 @@ Usage:
         --wandb_entity <ENTITY>
 """
 
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -79,12 +80,14 @@ class GenerateConfig:
     shift_name: str = "none"                         # Shift family. Options: none, appearance
     shift_mode: str = "noise_blur_gamma"             # Shift mode. Options (appearance): noise_blur_gamma
     severity: int = 1                                # Shift severity (used when shift_name != none). Range: [1, 5]
+    sweep_severity: Optional[int] = None             # Sweep severity label for plotting/aggregation. Range: [0, 4]
 
     #################################################################################################################
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    metrics_output_path: Optional[Union[str, Path]] = None  # Optional path for structured metrics JSON output
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
@@ -101,6 +104,9 @@ def validate_shift_config(cfg: GenerateConfig) -> None:
         raise ValueError(f"Unexpected shift_name '{cfg.shift_name}'. Supported values: {sorted(SUPPORTED_SHIFT_NAMES)}")
     if cfg.shift_mode not in SUPPORTED_SHIFT_MODES:
         raise ValueError(f"Unexpected shift_mode '{cfg.shift_mode}'. Supported values: {sorted(SUPPORTED_SHIFT_MODES)}")
+    if cfg.sweep_severity is not None:
+        if not isinstance(cfg.sweep_severity, int) or not (0 <= cfg.sweep_severity <= 4):
+            raise ValueError(f"Expected sweep_severity to be an integer in [0, 4], got: {cfg.sweep_severity}")
     if cfg.shift_name == "none":
         return
     if not isinstance(cfg.severity, int) or not (1 <= cfg.severity <= 5):
@@ -112,12 +118,13 @@ def validate_shift_config(cfg: GenerateConfig) -> None:
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
+    # OpenVLA README recommends center-crop for image-augmentation fine-tuned checkpoints.
     if "image_aug" in cfg.pretrained_checkpoint:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
     validate_shift_config(cfg)
 
-    # Set random seed
+    # Set random seed. Note: small cross-machine variation may remain due to GPU nondeterminism.
     set_seed_everywhere(cfg.seed)
 
     # [OpenVLA] Set action un-normalization key
@@ -144,6 +151,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
     run_id += f"--shift={cfg.shift_name}"
     if cfg.shift_name != "none":
         run_id += f"--mode={cfg.shift_mode}--severity={cfg.severity}"
+    if cfg.sweep_severity is not None:
+        run_id += f"--sweep_s={cfg.sweep_severity}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
     os.makedirs(cfg.local_log_dir, exist_ok=True)
@@ -165,7 +174,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     print(f"Task suite: {cfg.task_suite_name}")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
-    shift_cfg_str = f"Shift config: shift_name={cfg.shift_name}, shift_mode={cfg.shift_mode}, severity={cfg.severity}"
+    shift_cfg_str = (
+        f"Shift config: shift_name={cfg.shift_name}, shift_mode={cfg.shift_mode}, "
+        f"severity={cfg.severity}, sweep_severity={cfg.sweep_severity}"
+    )
     print(shift_cfg_str)
     log_file.write(shift_cfg_str + "\n")
 
@@ -174,6 +186,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    per_task_metrics = []
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -295,28 +308,82 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.flush()
 
         # Log final results
-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-        log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
-        log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
+        current_task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0.0
+        current_total_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0.0
+        print(f"Current task success rate: {current_task_success_rate}")
+        print(f"Current total success rate: {current_total_success_rate}")
+        log_file.write(f"Current task success rate: {current_task_success_rate}\n")
+        log_file.write(f"Current total success rate: {current_total_success_rate}\n")
         log_file.flush()
+        per_task_metrics.append(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "task_episodes": task_episodes,
+                "task_successes": task_successes,
+                "task_success_rate": current_task_success_rate,
+            }
+        )
         if cfg.use_wandb:
             wandb.log(
                 {
-                    f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
+                    f"success_rate/{task_description}": current_task_success_rate,
                     f"num_episodes/{task_description}": task_episodes,
                 }
             )
 
-    # Save local log file
+    total_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0.0
+
+    metrics_payload = {
+        "schema_version": "1.0",
+        "run_id": run_id,
+        "run_id_note": cfg.run_id_note,
+        "timestamp": DATE_TIME,
+        "model_family": cfg.model_family,
+        "pretrained_checkpoint": str(cfg.pretrained_checkpoint),
+        "task_suite_name": cfg.task_suite_name,
+        "seed": cfg.seed,
+        "center_crop": cfg.center_crop,
+        "num_trials_per_task": cfg.num_trials_per_task,
+        "shift_name": cfg.shift_name,
+        "shift_mode": cfg.shift_mode,
+        "severity": cfg.severity,
+        "sweep_severity": cfg.sweep_severity,
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "total_success_rate": total_success_rate,
+        "per_task": per_task_metrics,
+    }
+
+    if cfg.metrics_output_path is not None:
+        metrics_output_path = Path(cfg.metrics_output_path)
+    else:
+        metrics_output_path = Path(cfg.local_log_dir) / f"{run_id}.metrics.json"
+    metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(metrics_output_path, "w") as metrics_file:
+        json.dump(metrics_payload, metrics_file, indent=2, sort_keys=True)
+
+    metrics_path_str = str(metrics_output_path)
+    print(f"Saved metrics JSON at path {metrics_path_str}")
+    log_file.write(f"Saved metrics JSON at path {metrics_path_str}\n")
+
+    # Save local log file after all summary writes complete.
     log_file.close()
 
     # Push total metrics and local log file to wandb
     if cfg.use_wandb:
         wandb.log(
             {
-                "success_rate/total": float(total_successes) / float(total_episodes),
+                "success_rate/total": total_success_rate,
                 "num_episodes/total": total_episodes,
+                "summary/total_successes": total_successes,
+                "summary/total_episodes": total_episodes,
+                "summary/total_success_rate": total_success_rate,
+                "summary/seed": cfg.seed,
+                "summary/shift_name": cfg.shift_name,
+                "summary/shift_mode": cfg.shift_mode,
+                "summary/severity": cfg.severity,
+                "summary/sweep_severity": -1 if cfg.sweep_severity is None else cfg.sweep_severity,
             }
         )
         wandb.save(local_log_filepath)
