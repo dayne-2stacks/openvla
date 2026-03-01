@@ -33,6 +33,10 @@ import wandb
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
 from experiments.robot.libero.libero_utils import (
+    SUPPORTED_SHIFT_MODES,
+    SUPPORTED_SHIFT_NAMES,
+    apply_shift,
+    build_episode_shift_state,
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
@@ -72,6 +76,10 @@ class GenerateConfig:
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
 
+    shift_name: str = "none"                         # Shift family. Options: none, appearance
+    shift_mode: str = "noise_blur_gamma"             # Shift mode. Options (appearance): noise_blur_gamma
+    severity: int = 1                                # Shift severity (used when shift_name != none). Range: [1, 5]
+
     #################################################################################################################
     # Utils
     #################################################################################################################
@@ -87,12 +95,27 @@ class GenerateConfig:
     # fmt: on
 
 
+def validate_shift_config(cfg: GenerateConfig) -> None:
+    """Validates shift config values and fails fast on invalid combinations."""
+    if cfg.shift_name not in SUPPORTED_SHIFT_NAMES:
+        raise ValueError(f"Unexpected shift_name '{cfg.shift_name}'. Supported values: {sorted(SUPPORTED_SHIFT_NAMES)}")
+    if cfg.shift_mode not in SUPPORTED_SHIFT_MODES:
+        raise ValueError(f"Unexpected shift_mode '{cfg.shift_mode}'. Supported values: {sorted(SUPPORTED_SHIFT_MODES)}")
+    if cfg.shift_name == "none":
+        return
+    if not isinstance(cfg.severity, int) or not (1 <= cfg.severity <= 5):
+        raise ValueError(f"Expected severity to be an integer in [1, 5], got: {cfg.severity}")
+    if cfg.shift_name == "appearance" and cfg.shift_mode != "noise_blur_gamma":
+        raise ValueError("Appearance shift currently only supports shift_mode='noise_blur_gamma'.")
+
+
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
     if "image_aug" in cfg.pretrained_checkpoint:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    validate_shift_config(cfg)
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
@@ -118,6 +141,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    run_id += f"--shift={cfg.shift_name}"
+    if cfg.shift_name != "none":
+        run_id += f"--mode={cfg.shift_mode}--severity={cfg.severity}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
     os.makedirs(cfg.local_log_dir, exist_ok=True)
@@ -139,6 +165,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     print(f"Task suite: {cfg.task_suite_name}")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
+    shift_cfg_str = f"Shift config: shift_name={cfg.shift_name}, shift_mode={cfg.shift_mode}, severity={cfg.severity}"
+    print(shift_cfg_str)
+    log_file.write(shift_cfg_str + "\n")
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -170,6 +199,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Setup
             t = 0
             replay_images = []
+            shift_state = build_episode_shift_state(cfg, resize_size, task_id, episode_idx)
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -183,6 +213,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
+            if shift_state["enabled"]:
+                episode_shift_str = (
+                    "Episode shift params: "
+                    f"task_id={task_id}, episode_idx={episode_idx}, seed={shift_state['seed']}, "
+                    f"gamma={shift_state['gamma']:.4f}, noise_std={shift_state['noise_std']:.4f}, "
+                    f"blur_sigma={shift_state['blur_sigma']:.4f}"
+                )
+                print(episode_shift_str)
+                log_file.write(episode_shift_str + "\n")
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -194,6 +233,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # Get preprocessed image
                     img = get_libero_image(obs, resize_size)
+                    img = apply_shift(img, cfg, shift_state)
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)

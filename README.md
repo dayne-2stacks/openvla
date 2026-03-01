@@ -580,6 +580,29 @@ python experiments/robot/libero/run_libero_eval.py \
   --center_crop True
 ```
 
+#### Appearance Shift Evaluation (Optional)
+
+`run_libero_eval.py` now supports deterministic appearance shifts at evaluation time:
+
+* `--shift_name`: shift family (`none` by default, or `appearance`)
+* `--shift_mode`: mode for the shift (`noise_blur_gamma` by default)
+* `--severity`: integer severity in `[1, 5]` (used when `--shift_name appearance`)
+
+The default configuration (`--shift_name none`) preserves the original behavior exactly.
+
+```bash
+# Reproducible appearance-shift eval (same seed/task/episode -> same perturbation)
+python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial \
+  --center_crop True \
+  --shift_name appearance \
+  --shift_mode noise_blur_gamma \
+  --severity 3 \
+  --seed 7
+```
+
 Notes:
 * The evaluation script will run 500 trials by default (10 tasks x 50 episodes each). You can modify the number of
   trials per task by setting `--num_trials_per_task`. You can also change the random seed via `--seed`.
