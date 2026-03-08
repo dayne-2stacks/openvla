@@ -52,7 +52,7 @@ class SweepConfig:
     # Sweep axes
     #################################################################################################################
     shift_names: List[str] = field(default_factory=lambda: ["appearance"])
-    sweep_severities: List[int] = field(default_factory=lambda: [ 1, 2, 3, 4])
+    sweep_severities: List[int] = field(default_factory=lambda: [1, 2, 3, 4, 5])
     seeds: List[int] = field(default_factory=lambda: [0, 1, 2])
     shift_mode: str = "gamma"
 
@@ -124,25 +124,22 @@ def _validate_sweep_cfg(cfg: SweepConfig) -> None:
             f"Unexpected shift_mode '{cfg.shift_mode}'. Supported values: {sorted(SUPPORTED_SHIFT_MODES)}"
         )
     for severity in cfg.sweep_severities:
-        if severity < 0 or severity > 4:
-            raise ValueError(f"Expected sweep severity in [0, 4], got {severity}.")
+        if severity < 1 or severity > 5:
+            raise ValueError(f"Expected sweep severity in [1, 5], got {severity}.")
 
 
 def _map_eval_shift(shift_name: str, sweep_severity: int) -> Tuple[str, int]:
     """
-    Maps external sweep severity (0..4) to eval config:
-      - 0 -> baseline (shift_name=none, severity=1 unused)
-      - 1..4 -> perturbed run
+    Maps external sweep severity (1..5) to eval config.
     """
-    if sweep_severity == 0:
-        return "none",  1
+    if shift_name == "none":
+        return "none", 1
 
     if shift_name == "appearance":
-        return "appearance",  sweep_severity
+        return "appearance", sweep_severity
 
     raise NotImplementedError(
-        f"Shift '{shift_name}' is not implemented yet in run_libero_eval.py. "
-        "Currently supported for non-zero severity: appearance."
+        f"Shift '{shift_name}' is not implemented yet in run_libero_eval.py."
     )
 
 
@@ -177,6 +174,9 @@ def run_shift_sweep(cfg: SweepConfig) -> None:
     run_idx = 0
     for shift_name in cfg.shift_names:
         for sweep_severity in cfg.sweep_severities:
+            if cfg.shift_mode == "texture" and sweep_severity == 5:
+                print(f"Skipping severity 5 because texture shift_mode only supports 1-4 (seed {seed}).")
+                continue
             for seed in cfg.seeds:
                 run_idx += 1
                 effective_shift_name, severity = _map_eval_shift(shift_name, sweep_severity)

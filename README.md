@@ -587,7 +587,7 @@ python experiments/robot/libero/run_libero_eval.py \
 * `--shift_name`: shift family (`none` by default, or `appearance`)
 * `--shift_mode`: mode for the shift (`gamma` by default; options: `noise`, `blur`, `gamma`)
 * `--severity`: integer severity in `[1, 5]` (used when `--shift_name appearance`)
-* `--sweep_severity`: optional sweep label in `[0, 4]` used for aggregation/plotting
+* `--sweep_severity`: optional sweep label in `[1, 5]` used for aggregation/plotting
 * `--metrics_output_path`: optional explicit path for structured metrics JSON output
 
 The default configuration (`--shift_name none`) preserves the original behavior exactly.
@@ -612,7 +612,7 @@ Each run now writes a structured metrics file:
 You can automate severity/seed sweeps and plotting with:
 
 ```bash
-# Launch severity x seed sweep (defaults: severity 0..4, seeds 0/1/2, 5 trials per task)
+# Launch severity x seed sweep (defaults: severity 1..5, seeds 0/1/2, 5 trials per task)
 python experiments/robot/libero/run_shift_sweep.py \
   --model_family openvla \
   --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \

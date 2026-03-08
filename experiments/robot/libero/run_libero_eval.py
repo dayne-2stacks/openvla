@@ -42,6 +42,7 @@ from experiments.robot.libero.libero_utils import (
     get_libero_env,
     get_libero_image,
     quat2axisangle,
+    replace_target_textures,
     save_rollout_video,
 )
 from experiments.robot.openvla_utils import get_processor
@@ -78,9 +79,9 @@ class GenerateConfig:
     num_trials_per_task: int = 50                    # Number of rollouts per task
 
     shift_name: str = "none"                         # Shift family. Options: none, appearance
-    shift_mode: str = "gamma"                        # Shift mode. Options (appearance): noise, blur, gamma
+    shift_mode: str = "gamma"                        # Shift mode. Options (appearance): noise, blur, gamma, texture
     severity: int = 1                                # Shift severity (used when shift_name != none). Range: [1, 5]
-    sweep_severity: Optional[int] = None             # Sweep severity label for plotting/aggregation. Range: [0, 4]
+    sweep_severity: Optional[int] = None             # Sweep severity label for plotting/aggregation. Range: [1, 5]
 
     #################################################################################################################
     # Utils
@@ -105,8 +106,8 @@ def validate_shift_config(cfg: GenerateConfig) -> None:
     if cfg.shift_mode not in SUPPORTED_SHIFT_MODES:
         raise ValueError(f"Unexpected shift_mode '{cfg.shift_mode}'. Supported values: {sorted(SUPPORTED_SHIFT_MODES)}")
     if cfg.sweep_severity is not None:
-        if not isinstance(cfg.sweep_severity, int) or not (0 <= cfg.sweep_severity <= 4):
-            raise ValueError(f"Expected sweep_severity to be an integer in [0, 4], got: {cfg.sweep_severity}")
+        if not isinstance(cfg.sweep_severity, int) or not (1 <= cfg.sweep_severity <= 5):
+            raise ValueError(f"Expected sweep_severity to be an integer in [1, 5], got: {cfg.sweep_severity}")
     if cfg.shift_name == "none":
         return
     if not isinstance(cfg.severity, int) or not (1 <= cfg.severity <= 5):
@@ -204,6 +205,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             # Reset environment
             env.reset()
+            shift_state = build_episode_shift_state(cfg, resize_size, task_id, episode_idx)
+
+            texture_shift_info = None
+            if shift_state["enabled"] and cfg.shift_mode == "texture":
+                texture_shift_info = replace_target_textures(env, seed=shift_state["seed"], severity=cfg.severity)
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -211,7 +217,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Setup
             t = 0
             replay_images = []
-            shift_state = build_episode_shift_state(cfg, resize_size, task_id, episode_idx)
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -226,12 +231,21 @@ def eval_libero(cfg: GenerateConfig) -> None:
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
             if shift_state["enabled"]:
-                episode_shift_str = (
-                    "Episode shift params: "
-                    f"task_id={task_id}, episode_idx={episode_idx}, seed={shift_state['seed']}, "
-                    f"gamma={shift_state['gamma']:.4f}, noise_std={shift_state['noise_std']:.4f}, "
-                    f"blur_sigma={shift_state['blur_sigma']:.4f}"
-                )
+                if cfg.shift_mode == "texture":
+                    swapped_count = 0 if texture_shift_info is None else texture_shift_info["swapped_material_count"]
+                    target_count = 0 if texture_shift_info is None else texture_shift_info["target_material_count"]
+                    episode_shift_str = (
+                        "Episode shift params: "
+                        f"task_id={task_id}, episode_idx={episode_idx}, seed={shift_state['seed']}, "
+                        f"texture_swapped_materials={swapped_count}/{target_count}"
+                    )
+                else:
+                    episode_shift_str = (
+                        "Episode shift params: "
+                        f"task_id={task_id}, episode_idx={episode_idx}, seed={shift_state['seed']}, "
+                        f"gamma={shift_state['gamma']:.4f}, noise_std={shift_state['noise_std']:.4f}, "
+                        f"blur_sigma={shift_state['blur_sigma']:.4f}"
+                    )
                 print(episode_shift_str)
                 log_file.write(episode_shift_str + "\n")
             while t < max_steps + cfg.num_steps_wait:

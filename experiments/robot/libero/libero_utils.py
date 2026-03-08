@@ -1,19 +1,22 @@
 """Utils for evaluating policies in LIBERO simulation environments."""
 
+from pathlib import Path
+import ast
+import inspect
+import libero.envs.textures as textures
 import math
 import os
 
 import imageio
 import numpy as np
 import tensorflow as tf
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv, postprocess_model_xml
 from experiments.robot.robot_utils import (
     DATE,
     DATE_TIME,
 )
+from libero.libero import get_libero_path
+from libero.libero.envs import OffScreenRenderEnv, postprocess_model_xml
 import xml.etree.ElementTree as ET
-import copy
 
 SUPPORTED_SHIFT_NAMES = {"none", "appearance"}
 SUPPORTED_SHIFT_MODES = {"noise", "blur", "gamma", "texture"}
@@ -21,6 +24,7 @@ SEVERITY_TO_GAMMA_OFFSET = [0.05, 0.10, 0.15, 0.20, 0.25]
 SEVERITY_TO_NOISE_STD = [3.0, 6.0, 9.0, 12.0, 15.0]
 SEVERITY_TO_BLUR_SIGMA = [0.4, 0.8, 1.2, 1.6, 2.0]
 MAX_BLUR_KERNEL_SIZE = 13
+
 
 
 def _to_hw_tuple(resize_size):
@@ -109,7 +113,9 @@ def build_episode_shift_state(cfg, resize_size, task_id, episode_idx):
     rng = np.random.default_rng(seed_sequence)
     gamma_sign = -1.0 if rng.random() < 0.5 else 1.0
     gamma = 1.0 + gamma_sign * gamma_offset
-    noise_map = rng.normal(loc=0.0, scale=noise_std, size=(resize_size[0], resize_size[1], 3)).astype(np.float32)
+    noise_map = None
+    if cfg.shift_mode == "noise":
+        noise_map = rng.normal(loc=0.0, scale=noise_std, size=(resize_size[0], resize_size[1], 3)).astype(np.float32)
 
     return {
         "enabled": True,
@@ -120,7 +126,7 @@ def build_episode_shift_state(cfg, resize_size, task_id, episode_idx):
         "gamma": gamma,
         "noise_std": noise_std,
         "blur_sigma": blur_sigma,
-        "noise_map": noise_map if cfg.shift_mode == "noise" else None,
+        "noise_map": noise_map,
     }
 
 
@@ -132,6 +138,9 @@ def apply_shift(img, cfg, shift_state):
         raise ValueError(f"Unsupported shift_name: {cfg.shift_name}")
     if cfg.shift_mode not in SUPPORTED_SHIFT_MODES:
         raise ValueError(f"Unsupported shift_mode: {cfg.shift_mode}")
+    if cfg.shift_mode == "texture":
+        # Texture shift is applied in the simulator at reset-time (not in image postprocessing).
+        return img
 
     shifted_img = img.astype(np.float32)
 
@@ -160,54 +169,165 @@ def get_libero_env(task, model_family, resolution=256):
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 
-def get_target_objects(env):
-    xml = env.sim.model.get_xml()
-    xml = postprocess_model_xml(xml, {})
-
-    targets = list(env.obj_of_interest)
-
-    root_body_to_obj = {}
-    for obj in targets:
-        if hasattr(env, "env") and hasattr(env.env, "objects_dict") and obj in env.env.objects_dict:
-            root_body = env.env.objects_dict[obj].root_body
-        else:
-            root_body = obj  # fallback
-        root_body_to_obj[root_body] = obj
-
-    return xml, root_body_to_obj
 
 
-def replace_target_textures(env):
-    xml, target_to_root_body = get_target_objects(env)
-    # get xml repr
+def get_texture_groups():
+
+    background_names = {"wall", "plaster", "sky"}
+    table_names = {"floor", "ceramic", "table"}
+
+    path = Path(inspect.getsourcefile(textures))
+
+    module = ast.parse(path.read_text())
+
+    TEXTURE_MAPPING = None
+
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "TEXTURE_MAPPING":
+                    TEXTURE_MAPPING = ast.literal_eval(node.value)
+
+    if TEXTURE_MAPPING is None:
+        raise ValueError("TEXTURE_MAPPING not found in textures.py")
+
+    walls = []
+    tables = []
+
+    for tex_id, tex_name in TEXTURE_MAPPING.items():
+        name = tex_name.lower()
+
+        if any(k in name for k in table_names):
+            tables.append(tex_id)
+
+        elif any(k in name for k in background_names):
+            walls.append(tex_id)
+
+    return walls, tables
+
+
+def get_xml(env):
+    if not hasattr(env, "_texture_shift_base_xml"):
+        xml = env.sim.model.get_xml()
+        xml = postprocess_model_xml(xml, {})
+        env._texture_shift_base_xml = xml
+    xml = env._texture_shift_base_xml
+
+    return xml
+
+
+def replace_target_textures(env, severity, seed):
+
+    if not isinstance(severity, int) or not (1 <= severity <= 4):
+        raise ValueError(f"Expected severity to be an integer in [1,4], got: {severity}")
+
+    rng = np.random.default_rng(seed)
+
+    walls, floors = get_texture_groups()
+
+    wall_texture = None
+    floor_texture = None
+
+    if severity in (2, 4):
+        wall_texture = rng.choice(walls)
+
+    if severity in (3, 4):
+        floor_texture = rng.choice(floors)
+
+    xml = get_xml(env)
     root = ET.fromstring(xml)
-    
+
     asset = root.find("asset")
     worldbody = root.find("worldbody")
 
-    # get textures and materials
-    textures = {t.get("name") : t for t in asset.findall("texture") if t.get("name")}
-    materials = {m.get("name") : m for m in asset.findall("material") if m.get("name")}
+    if asset is None or worldbody is None:
+        return {"applied": False, "swapped_material_count": 0, "target_material_count": 0}
 
-    target_root_bodies = set(target_to_root_body.keys())
+    textures = {t.get("name"): t for t in asset.findall("texture") if t.get("name")}
+    materials = {m.get("name"): m for m in asset.findall("material") if m.get("name")}
 
-    target_geoms: dict[str, list[ET.Element]] = {}  # obj -> geom elems
-    for root_body_name, obj_name in target_to_root_body.items():
-        body_elem = None
-        for body in worldbody.iter("body"):
-            if body.get("name") == root_body_name:
-                body_elem = body
-                break
-        if body_elem is None:
+    target_materials = {
+        "wall": set(),
+        "table": set(),
+    }
+
+    # --------------------------------------------------
+    # Traverse worldbody once
+    # --------------------------------------------------
+
+    for elem in worldbody.iter():
+
+        if elem.tag not in {"geom", "body"}:
             continue
-        geoms = [geom for geom in root_body_elem.iter("geom")]  
-        
-        geoms = [g for g in geoms if g.get("material")]
 
-        target_geoms[obj_name] = geoms
-    
-                
-    
+        name = elem.get("name")
+        if name is None:
+            continue
+
+        name = name.lower()
+
+        group = None
+
+        if "wall" in name:
+            group = "wall"
+
+        elif "table" in name or "leg" in name:
+            group = "table"
+
+        if group is None:
+            continue
+
+        material_name = elem.get("material")
+        if material_name not in materials:
+            continue
+
+        texture_name = materials[material_name].get("texture")
+        if texture_name not in textures:
+            continue
+
+        if textures[texture_name].get("file") is None:
+            continue
+
+        target_materials[group].add(material_name)
+
+    swapped = []
+
+    # --------------------------------------------------
+    # Swap wall textures
+    # --------------------------------------------------
+
+    if wall_texture is not None:
+        for m in target_materials["wall"]:
+            materials[m].set("texture", wall_texture)
+            swapped.append(m)
+
+    # --------------------------------------------------
+    # Swap table textures
+    # --------------------------------------------------
+
+    if floor_texture is not None:
+        for m in target_materials["table"]:
+            materials[m].set("texture", floor_texture)
+            swapped.append(m)
+
+    if not swapped:
+        return {
+            "applied": False,
+            "swapped_material_count": 0,
+            "target_material_count": 0,
+        }
+
+    updated_xml = ET.tostring(root, encoding="utf8").decode("utf8")
+
+    env.reset_from_xml_string(updated_xml)
+
+    return {
+        "applied": True,
+        "swapped_material_count": len(swapped),
+        "target_material_count": sum(len(v) for v in target_materials.values()),
+        "swapped_materials": sorted(swapped),
+    }
+
 def get_libero_dummy_action(model_family: str):
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
