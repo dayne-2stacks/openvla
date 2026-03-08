@@ -3,7 +3,7 @@
 from pathlib import Path
 import ast
 import inspect
-import libero.envs.textures as textures
+import libero.libero.envs.textures as textures
 import math
 import os
 
@@ -15,7 +15,8 @@ from experiments.robot.robot_utils import (
     DATE_TIME,
 )
 from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv, postprocess_model_xml
+from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.envs.utils import postprocess_model_xml
 import xml.etree.ElementTree as ET
 
 SUPPORTED_SHIFT_NAMES = {"none", "appearance"}
@@ -223,17 +224,6 @@ def replace_target_textures(env, severity, seed):
 
     rng = np.random.default_rng(seed)
 
-    walls, floors = get_texture_groups()
-
-    wall_texture = None
-    floor_texture = None
-
-    if severity in (2, 4):
-        wall_texture = rng.choice(walls)
-
-    if severity in (3, 4):
-        floor_texture = rng.choice(floors)
-
     xml = get_xml(env)
     root = ET.fromstring(xml)
 
@@ -245,6 +235,17 @@ def replace_target_textures(env, severity, seed):
 
     textures = {t.get("name"): t for t in asset.findall("texture") if t.get("name")}
     materials = {m.get("name"): m for m in asset.findall("material") if m.get("name")}
+
+    wall_textures, floor_textures = get_texture_groups_from_asset(textures)
+
+    wall_texture = None
+    floor_texture = None
+
+    if severity in (2, 4) and wall_textures:
+        wall_texture = str(rng.choice(wall_textures))
+
+    if severity in (3, 4) and floor_textures:
+        floor_texture = str(rng.choice(floor_textures))
 
     target_materials = {
         "wall": set(),
@@ -262,19 +263,6 @@ def replace_target_textures(env, severity, seed):
 
         name = elem.get("name")
         if name is None:
-            continue
-
-        name = name.lower()
-
-        group = None
-
-        if "wall" in name:
-            group = "wall"
-
-        elif "table" in name or "leg" in name:
-            group = "table"
-
-        if group is None:
             continue
 
         material_name = elem.get("material")
