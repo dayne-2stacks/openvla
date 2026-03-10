@@ -2,8 +2,8 @@
 analyze_shift_sweeps.py
 
 Aggregates metrics.json outputs from run_libero_eval.py / run_shift_sweep.py and generates:
-  - per-shift severity curves with error bars,
-  - per-shift CSV tables,
+  - per-shift_mode severity curves with error bars,
+  - per-shift_mode CSV tables,
   - Markdown and JSON summaries including failure threshold extraction.
 """
 
@@ -72,6 +72,13 @@ def _resolve_group_shift_name(record: Dict) -> str:
     return shift_name
 
 
+def _resolve_group_shift_mode(record: Dict) -> str:
+    shift_mode = record.get("shift_mode")
+    if shift_mode is None:
+        return "unknown"
+    return str(shift_mode)
+
+
 def _load_metric_records(pattern: str) -> List[Dict]:
     files = sorted(glob.glob(pattern))
     records = []
@@ -93,12 +100,14 @@ def _filter_records(records: List[Dict], cfg: AnalyzeConfig) -> List[Dict]:
             if cfg.checkpoint_substring not in checkpoint:
                 continue
         group_shift_name = _resolve_group_shift_name(record)
+        group_shift_mode = _resolve_group_shift_mode(record)
         if len(cfg.shift_names) > 0 and group_shift_name not in cfg.shift_names:
             continue
         sweep_severity = _resolve_sweep_severity(record)
         if sweep_severity is None:
             continue
         record["_group_shift_name"] = group_shift_name
+        record["_group_shift_mode"] = group_shift_mode
         record["_resolved_sweep_severity"] = sweep_severity
         filtered.append(record)
     return filtered
@@ -107,11 +116,11 @@ def _filter_records(records: List[Dict], cfg: AnalyzeConfig) -> List[Dict]:
 def _compute_group_stats(records: List[Dict]) -> Dict[str, List[Dict]]:
     grouped = defaultdict(list)
     for record in records:
-        key = (record["_group_shift_name"], record["_resolved_sweep_severity"])
+        key = (record["_group_shift_mode"], record["_resolved_sweep_severity"])
         grouped[key].append(float(record["total_success_rate"]))
 
-    shift_to_rows = defaultdict(list)
-    for (shift_name, severity), values in grouped.items():
+    shift_mode_to_rows = defaultdict(list)
+    for (shift_mode, severity), values in grouped.items():
         n = len(values)
         mean = sum(values) / n
         if n > 1:
@@ -120,7 +129,7 @@ def _compute_group_stats(records: List[Dict]) -> Dict[str, List[Dict]]:
         else:
             std = 0.0
         stderr = std / math.sqrt(n) if n > 0 else 0.0
-        shift_to_rows[shift_name].append(
+        shift_mode_to_rows[shift_mode].append(
             {
                 "severity": int(severity),
                 "n": n,
@@ -130,9 +139,9 @@ def _compute_group_stats(records: List[Dict]) -> Dict[str, List[Dict]]:
             }
         )
 
-    for shift_name in shift_to_rows:
-        shift_to_rows[shift_name] = sorted(shift_to_rows[shift_name], key=lambda row: row["severity"])
-    return dict(shift_to_rows)
+    for shift_mode in shift_mode_to_rows:
+        shift_mode_to_rows[shift_mode] = sorted(shift_mode_to_rows[shift_mode], key=lambda row: row["severity"])
+    return dict(shift_mode_to_rows)
 
 
 def _write_shift_csv(output_dir: Path, shift_name: str, rows: List[Dict]) -> Path:
