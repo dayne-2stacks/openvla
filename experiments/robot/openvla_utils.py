@@ -124,47 +124,200 @@ def crop_and_resize(image, crop_scale, batch_size):
     return image
 
 
-def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, center_crop=False):
-    """Generates an action with the VLA policy."""
-    image = Image.fromarray(obs["full_image"])
-    image = image.convert("RGB")
+def get_vla_action(
+    vla,
+    processor,
+    base_vla_name,
+    obs,
+    task_label,
+    unnorm_key,
+    center_crop=False,
+    return_probs=False,
+    do_sample=False,
+    temperature=1.0,
+):
+    """Generate an action with the VLA policy, optionally with token logprobs."""
+    image = Image.fromarray(obs["full_image"]).convert("RGB")
 
-    # (If trained with image augmentations) Center crop image and then resize back up to original size.
-    # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
-    #            the original height and width by sqrt(0.9) -- not 0.9!
     if center_crop:
         batch_size = 1
         crop_scale = 0.9
-
-        # Convert to TF Tensor and record original data type (should be tf.uint8)
         image = tf.convert_to_tensor(np.array(image))
         orig_dtype = image.dtype
-
-        # Convert to data type tf.float32 and values between [0,1]
         image = tf.image.convert_image_dtype(image, tf.float32)
-
-        # Crop and then resize back to original size
         image = crop_and_resize(image, crop_scale, batch_size)
-
-        # Convert back to original data type
         image = tf.clip_by_value(image, 0, 1)
         image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
+        image = Image.fromarray(image.numpy()).convert("RGB")
 
-        # Convert back to PIL Image
-        image = Image.fromarray(image.numpy())
-        image = image.convert("RGB")
-
-    # Build VLA prompt
-    if "openvla-v01" in base_vla_name:  # OpenVLA v0.1
+    if "openvla-v01" in base_vla_name:
         prompt = (
-            f"{OPENVLA_V01_SYSTEM_PROMPT} USER: What action should the robot take to {task_label.lower()}? ASSISTANT:"
+            f"{OPENVLA_V01_SYSTEM_PROMPT} USER: "
+            f"What action should the robot take to {task_label.lower()}? ASSISTANT:"
         )
-    else:  # OpenVLA
+    else:
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
-    # Process inputs.
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
 
-    # Get action.
-    action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
-    return action
+    input_ids = inputs["input_ids"]
+    if not torch.all(input_ids[:, -1] == 29871):
+        input_ids = torch.cat(
+            (input_ids, torch.tensor([[29871]], device=input_ids.device, dtype=input_ids.dtype)),
+            dim=1,
+        )
+
+    gen_kwargs = dict(
+        input_ids=input_ids,
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=vla.get_action_dim(unnorm_key),
+        do_sample=do_sample,
+    )
+    if do_sample:
+        gen_kwargs["temperature"] = temperature
+
+    if return_probs:
+        gen_kwargs["output_scores"] = True
+        gen_kwargs["return_dict_in_generate"] = True
+
+    gen = vla.generate(**gen_kwargs)
+    sequences = gen.sequences if return_probs else gen
+
+    action_token_ids = sequences[0, -vla.get_action_dim(unnorm_key):]
+    action_token_ids_np = action_token_ids.detach().cpu().numpy()
+
+    discretized_actions = vla.vocab_size - action_token_ids_np
+    discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=vla.bin_centers.shape[0] - 1)
+    normalized_actions = vla.bin_centers[discretized_actions]
+
+    action_norm_stats = vla.get_action_stats(unnorm_key)
+    mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+    action_high = np.array(action_norm_stats["q99"])
+    action_low = np.array(action_norm_stats["q01"])
+    actions = np.where(
+        mask,
+        0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+        normalized_actions,
+    )
+
+    if not return_probs:
+        return actions
+
+    step_log_probs = []
+    for step, tok_id in enumerate(action_token_ids):
+        step_scores = gen.scores[step][0].float()
+        step_log_probs.append(torch.log_softmax(step_scores, dim=-1)[tok_id])
+
+    step_log_probs = torch.stack(step_log_probs)
+    sequence_log_prob = step_log_probs.sum()
+
+    return {
+        "action": actions,
+        "action_token_ids": action_token_ids_np,
+        "step_log_probs": step_log_probs.detach().cpu().numpy(),
+        "sequence_log_prob": sequence_log_prob.item(),
+    }
+
+
+def get_logprob_of_action(
+    cfg,
+    model,
+    obs,
+    task_label,
+    action_token_ids,
+    processor=None,
+    center_crop=False,
+    temperature=1.0,
+):
+    """
+    Returns log pi_theta(action_token_ids | obs, task_label).
+
+    `action_token_ids` should be the sampled tokenized action from rollout time,
+    shape [action_dim] or [1, action_dim].
+    """
+    image = Image.fromarray(obs["full_image"]).convert("RGB")
+
+    if center_crop:
+        batch_size = 1
+        crop_scale = 0.9
+        image = tf.convert_to_tensor(np.array(image))
+        orig_dtype = image.dtype
+        image = tf.image.convert_image_dtype(image, tf.float32)
+        image = crop_and_resize(image, crop_scale, batch_size)
+        image = tf.clip_by_value(image, 0, 1)
+        image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
+        image = Image.fromarray(image.numpy()).convert("RGB")
+
+    if "openvla-v01" in cfg.pretrained_checkpoint:
+        prompt = (
+            f"{OPENVLA_V01_SYSTEM_PROMPT} USER: "
+            f"What action should the robot take to {task_label.lower()}? ASSISTANT:"
+        )
+    else:
+        prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
+
+    inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+
+    prompt_ids = inputs["input_ids"]
+    prompt_mask = inputs["attention_mask"]
+
+    # Match predict_action() prompt formatting
+    if not torch.all(prompt_ids[:, -1] == 29871):
+        extra = torch.tensor([[29871]], device=prompt_ids.device, dtype=prompt_ids.dtype)
+        prompt_ids = torch.cat([prompt_ids, extra], dim=1)
+        prompt_mask = torch.cat(
+            [prompt_mask, torch.ones((1, 1), device=prompt_mask.device, dtype=prompt_mask.dtype)],
+            dim=1,
+        )
+
+    if not torch.is_tensor(action_token_ids):
+        action_token_ids = torch.tensor(action_token_ids, device=prompt_ids.device, dtype=prompt_ids.dtype)
+    else:
+        action_token_ids = action_token_ids.to(device=prompt_ids.device, dtype=prompt_ids.dtype)
+
+    if action_token_ids.ndim == 1:
+        action_token_ids = action_token_ids.unsqueeze(0)
+
+    full_input_ids = torch.cat([prompt_ids, action_token_ids], dim=1)
+    full_attention_mask = torch.cat(
+        [
+            prompt_mask,
+            torch.ones(
+                (prompt_mask.shape[0], action_token_ids.shape[1]),
+                device=prompt_mask.device,
+                dtype=prompt_mask.dtype,
+            ),
+        ],
+        dim=1,
+    )
+
+    outputs = model(
+        input_ids=full_input_ids,
+        attention_mask=full_attention_mask,
+        pixel_values=inputs["pixel_values"],
+        output_projector_features=True,
+        return_dict=True,
+    )
+
+    logits = outputs.logits[0].float()
+    n_patches = outputs.projector_features.shape[1]
+    prompt_len = prompt_ids.shape[1]
+
+    step_log_probs = []
+    for k in range(action_token_ids.shape[1]):
+        tok_id = action_token_ids[0, k]
+
+        # Logit position that predicts token k in the action suffix.
+        logit_idx = n_patches + prompt_len - 1 + k
+
+        step_logits = logits[logit_idx]
+        if temperature != 1.0:
+            step_logits = step_logits / temperature
+
+        step_log_probs.append(torch.log_softmax(step_logits, dim=-1)[tok_id])
+
+    step_log_probs = torch.stack(step_log_probs)
+    sequence_log_prob = step_log_probs.sum()
+
+    return sequence_log_prob
+

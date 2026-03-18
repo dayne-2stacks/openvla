@@ -52,7 +52,7 @@ class SweepConfig:
     # Sweep axes
     #################################################################################################################
     shift_names: List[str] = field(default_factory=lambda: ["appearance"])
-    sweep_severities: List[int] = field(default_factory=lambda: [4, 5])
+    sweep_severities: List[int] = field(default_factory=lambda: [2, 3, 4, 5])
     seeds: List[int] = field(default_factory=lambda: [0, 1, 2])
     shift_mode: str = "gamma"
 

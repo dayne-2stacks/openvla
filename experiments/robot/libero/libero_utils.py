@@ -2,6 +2,7 @@
 
 import math
 import os
+from pathlib import Path
 
 import imageio
 import numpy as np
@@ -381,6 +382,23 @@ def save_rollout_video(rollout_images, idx, success, task_description,shift=None
     if log_file is not None:
         log_file.write(f"Saved rollout MP4 at path {mp4_path}\n")
     return mp4_path
+
+def save_image(img, task_id, episode_idx, t, task_description, shift=None, log_file=None):
+    """Saves an image."""
+    image_dir = f"./images/{DATE}"
+    if shift is not None:
+        image_dir = f"./images/{DATE}/{shift}"
+    os.makedirs(image_dir, exist_ok=True)
+    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    image_path = f"{image_dir}/{DATE_TIME}--image={task_id}--episode={episode_idx}--t={t}--task={processed_task_description}.jpg"
+    imageio.imwrite(image_path, img)
+    print(f"Saved image at path {image_path}")
+    if log_file is not None:
+        log_file.write(f"Saved image at path {image_path}\n")
+
+    abs_path = str(Path(image_path).resolve())
+    
+    return abs_path
 
 
 def quat2axisangle(quat):

@@ -623,7 +623,7 @@ python experiments/robot/libero/run_shift_sweep.py \
 
 # Aggregate metrics and generate curves/tables
 python experiments/robot/libero/analyze_shift_sweeps.py \
-  --metrics_glob "./experiments/logs/*.metrics.json" \
+  --metrics_glob "./experiments/log2/*.metrics.json" \
   --task_suite_name libero_spatial
 ```
 

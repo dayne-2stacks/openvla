@@ -23,9 +23,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
-import subprocess
-import time 
-import redis
 
 import draccus
 import numpy as np
@@ -47,9 +44,8 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     replace_target_textures,
     save_rollout_video,
-    save_image,
 )
-from experiments.robot.openvla_utils import get_processor, get_logprob_of_action
+from experiments.robot.openvla_utils import get_processor
 from experiments.robot.robot_utils import (
     DATE_TIME,
     get_action,
@@ -58,10 +54,7 @@ from experiments.robot.robot_utils import (
     invert_gripper_action,
     normalize_gripper_action,
     set_seed_everywhere,
-    get_action_policy
 )
-
-from experiments.robot.training_utils import OnlineAdapter
 
 
 @dataclass
@@ -103,15 +96,6 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
-
-    ###################################################################################################################
-    # TTVLA
-    #####################################################################################################################
-    tta: bool = True
-    ttvla_env: Optional[str] = 'ttvla'
-    tta_step: int = 5
-    tta_type: str = "ttvla" 
-    
     # fmt: on
 
 
@@ -147,7 +131,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Load model
     model = get_model(cfg)
-    
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
@@ -161,9 +144,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
-    if cfg.tta:
-        adapter = OnlineAdapter(model=model, processor=processor)
-        model = adapter.model
+
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
     run_id += f"--shift={cfg.shift_name}"
@@ -203,36 +184,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
-    if cfg.tta:
-        base = Path(os.environ["DATA_DIR"]) 
-        script = base / "vla" / "ttvla"/ "tta.py"
-        python_path = base /"envs"/ "ttvla"/ "bin"/ "python"
-        ready_token = f"{os.getpid()}-{time.time_ns()}"
-        tta_env = os.environ.copy()
-        tta_env["TTA_READY_TOKEN"] = ready_token
-
-
-        # Wait for Redis socket to be available and responsive
-        socket_path = f"{os.environ['DATA_DIR']}/tmp/redis.sock"
-
-        subprocess.Popen([
-            "conda", "run", "--no-capture-output", "-n", "ttvla",
-            "python", "-u",
-            str(script)
-        # No additional arguments needed for tta.py in this context
-        ], env=tta_env)
-
-        while True:
-            try:
-                r = redis.Redis(unix_socket_path=socket_path)
-                if r.get("tta:ready") == ready_token.encode():
-                    break
-            except redis.ConnectionError:
-                time.sleep(0.5)
-
-        socket_path = f"{os.environ['DATA_DIR']}/tmp/redis.sock"
-        r = redis.Redis(unix_socket_path=socket_path)
-
     # Start evaluation
     total_episodes, total_successes = 0, 0
     per_task_metrics = []
@@ -266,9 +217,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Setup
             t = 0
             replay_images = []
-            images = []
-            progress = []
-            buffer = []
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -315,6 +263,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
+
                     # Prepare observations dict
                     # Note: OpenVLA does not take proprio state as input
                     observation = {
@@ -325,15 +274,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     }
 
                     # Query model to get action
-                    action, action_tokens, log_probs = get_action_policy(
+                    action = get_action(
                         cfg,
                         model,
                         observation,
                         task_description,
                         processor=processor,
-                        return_probs=True,
                     )
-                    
+
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
 
@@ -349,45 +297,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         total_successes += 1
                         break
                     t += 1
-
-                    if cfg.tta == True:
-                         # Get preprocessed image
-                        img = get_libero_image(obs, resize_size)
-                        img = apply_shift(img, cfg, shift_state)
-                        observation_next = {
-                            "full_image": img,
-                            "state": np.concatenate(
-                                (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-                            ),
-                        }
-                        if t >= cfg.num_steps_wait:
-                            img_path = save_image(img, task_id, episode_idx, t, task_description, cfg.shift_mode, log_file)
-                            images.append(img_path)
-                            if len(images) >= 2:
-                                r.rpush("tta_images", json.dumps({"obs": images, "task_description": task_description}))
-
-                                _, result_raw = r.blpop("tta_results", timeout=30)
-                                result = json.loads(result_raw)
-                                value_list = result["value_list"]
-
-                                if len(value_list) > 0:
-                                    # print(f"value_list[0]: {value_list[0]}")
-                                    log_file.write(f"value_list[-1]: {value_list[-1]}\n")
-                                    log_file.flush()
-
-                                if len(value_list) >= 2:
-                                    progress.append(value_list[-1] - value_list[-2])
-                        if len(progress) > 0:
-                            entry = (observation, action_tokens, progress[-1], observation_next, log_probs)
-                            buffer.append(entry)
-                        if t >= cfg.num_steps_wait and t % cfg.tta_step == cfg.tta_step-1:
-                            metrics = adapter.update(buffer, task_description, cfg)
-                            if metrics is not None:
-                                print("Loss" , metrics.get("loss", "No loss in metrics"))
-                                log_file.write(f"Loss: {metrics.get('loss', 'No loss in metrics')}\n")
-                                log_file.flush()
-                            buffer = []
-                                
 
                 except Exception as e:
                     print(f"Caught exception: {e}")
