@@ -50,6 +50,7 @@ from experiments.robot.libero.libero_utils import (
     save_image,
 )
 from experiments.robot.openvla_utils import get_processor, get_logprob_of_action
+from experiments.robot.robomonkey_utils import get_robomonkey_action
 from experiments.robot.robot_utils import (
     DATE_TIME,
     get_action,
@@ -103,14 +104,25 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
-
     ###################################################################################################################
-    # TTVLA
+    # Online Adaptation / Inference Mode
+    # mode: "none"       -- plain single-sample inference, no adaptation
+    #        "ttvla"     -- TTA with OnlineAdapter (PPO) + TTVLA critic via Redis
+    #        "robomonkey"-- best-of-N with RoboMonkey verifier, no weight updates
     #####################################################################################################################
-    tta: bool = True
+    mode: str = "none"
+
+    # TTA / TTVLA options (used when mode == "ttvla")
     ttvla_env: Optional[str] = 'ttvla'
     tta_step: int = 5
-    tta_type: str = "ttvla" 
+
+    # RoboMonkey options (used when mode == "robomonkey")
+    initial_samples: int = 9
+    augmented_samples: int = 32
+    action_server_port: int = 3200
+    reward_server_port: int = 3100
+    task_id: int = 0
+
     
     # fmt: on
 
@@ -161,7 +173,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
-    if cfg.tta:
+    if cfg.mode == "ttvla":
         adapter = OnlineAdapter(model=model, processor=processor)
         model = adapter.model
     # Initialize local logging
@@ -203,7 +215,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
-    if cfg.tta:
+    if cfg.mode == "ttvla":
         base = Path(os.environ["DATA_DIR"]) 
         script = base / "vla" / "ttvla"/ "tta.py"
         python_path = base /"envs"/ "ttvla"/ "bin"/ "python"
@@ -325,14 +337,21 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     }
 
                     # Query model to get action
-                    action, action_tokens, log_probs = get_action_policy(
-                        cfg,
-                        model,
-                        observation,
-                        task_description,
-                        processor=processor,
-                        return_probs=True,
-                    )
+                    if cfg.mode == "robomonkey":
+                        action = get_robomonkey_action(
+                            observation, task_description, cfg,
+                            vla=model, processor=processor,
+                        )
+                        action_tokens, log_probs = None, None
+                    else:
+                        action, action_tokens, log_probs = get_action_policy(
+                            cfg,
+                            model,
+                            observation,
+                            task_description,
+                            processor=processor,
+                            return_probs=True,
+                        )
                     
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -350,7 +369,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         break
                     t += 1
 
-                    if cfg.tta == True:
+                    if cfg.mode == "ttvla":
                          # Get preprocessed image
                         img = get_libero_image(obs, resize_size)
                         img = apply_shift(img, cfg, shift_state)

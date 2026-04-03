@@ -323,7 +323,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # === Handle Generation with Cache (`input_ids.shape[1] == 1`) =>> requires `past_keys_values` ===
         if input_ids.shape[1] == 1:
-            assert input_ids.shape[0] == 1, "Generation is only currently supported for batch size of 1!"
+            # assert input_ids.shape[0] == 1, "Generation is only currently supported for batch size of 1!"
             assert past_key_values is not None, "You must provide `past_key_values` during cached generation!"
             assert labels is None, "Unexpected key `labels` provided during cached generation!"
 
@@ -457,10 +457,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         **kwargs: str,
     ) -> Dict[str, torch.Tensor]:
         """Borrowed from `LlamaForCausalLM` and simplified for batch size = 1; mirrors original PrismaticVLM logic."""
-        if ((input_ids is not None) and (input_ids.shape[0] > 1)) or (
-            (inputs_embeds is not None) and (inputs_embeds.shape[0] > 1)
-        ):
-            raise ValueError("Generation with batch size > 1 is not currently supported!")
+        # if ((input_ids is not None) and (input_ids.shape[0] > 1)) or (
+        #     (inputs_embeds is not None) and (inputs_embeds.shape[0] > 1)
+        # ):
+        #     raise ValueError("Generation with batch size > 1 is not currently supported!")
 
         # Handle `past_key_values` (cache) =>> assume `input_ids` just has unprocessed tokens
         if past_key_values is not None:

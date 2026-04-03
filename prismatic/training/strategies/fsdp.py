@@ -6,6 +6,7 @@ fine-grained control over wrapping policies and mixed precision per component).
 """
 
 import math
+import shutil
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path

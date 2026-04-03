@@ -24,6 +24,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import numpy as np
 
 import draccus
 import torch
@@ -81,6 +82,8 @@ class OnlineAdaptConfig:
     lora_dropout: float = 0.0
     center_crop: bool = True
     ppo_clip: float = 0.2
+    reward_mode: str = "robomonkey"
+    reward_server_port: int = 3100 
 
 # @dataclass
 # class RolloutEntry:
@@ -99,6 +102,37 @@ class OnlineAdapter:
             [p for p in self.model.parameters() if p.requires_grad],
             lr=self.cfg.learning_rate,
         )
+
+    def get_reward(self, obs, action_token_ids, task_description, img_path, redis_client=None, image_history=None):
+        """ Gets reward for a given observation and action token IDs, using either the RoboMonkey reward model or a custom reward server. """
+        if self.cfg.reward_mode == "robomonkey":
+            from experiments.robot.robomonkey_utils import _get_rewards
+
+            class _RewardCfg:
+                reward_server_port = self.cfg.reward_server_port
+
+            rewards = _get_rewards(task_description, img_path, action_token_ids, _RewardCfg)
+            return float(rewards[0])
+        elif self.cfg.reward_mode == "ttvla":
+            if redis_client is None or image_history is None or len(image_history) < 2:
+                return 0.0
+            import json
+            
+            redis_client.rpush("tta_images", json.dumps({
+                "obs" : image_history,
+                "task_description": task_description,
+            }))
+            result_raw = redis_client.blpop("tta_rewards", timeout=30)
+            if result_raw is None:
+                print("Timeout while waiting for reward from TTVLA server.")
+                return 0.0
+            value_list = json.loads(result_raw[1])["value_list"]
+            if len(value_list) < 2:
+                return 0.0
+            return float(value_list[-1]) - float(value_list[-2])
+        else:
+            raise ValueError(f"Invalid reward mode: {self.cfg.reward_mode}")
+
 
     def _attach_lora(self, model):
         lora_config = LoraConfig(
